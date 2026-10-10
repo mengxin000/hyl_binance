@@ -1,0 +1,14 @@
+{
+  "market_refresh_seconds": 300,
+  "sample_interval_ms": 1000,
+  "display_refresh_seconds": 1,
+  "quote_max_age_ms": 3000,
+  "quote_match_tolerance_ms": 500,
+  "raw_coalesce_interval_ms": 200,
+  "binance_symbols_per_connection": 50,
+  "hyperliquid_subscriptions_per_connection": 10,
+  "persist_interval_seconds": 60,
+  "quantile_refresh_seconds": 15,
+  "network_log_max_bytes": 20000000,
+  "data_directory": "data"
+}
