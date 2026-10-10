@@ -1,0 +1,18 @@
+# Python / uv
+.venv/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Local runtime output
+data/
+
+# Editors and local environments
+.idea/
+.vscode/
+.env
+./test/
+
