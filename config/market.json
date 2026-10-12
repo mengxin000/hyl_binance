@@ -4,9 +4,5 @@
   "hyperliquid_min_perp_volume_usdt": 2000000,
   "binance_min_spot_volume_usdt": 5000000,
   "binance_min_perp_volume_usdt": 10000000,
-  "base_aliases": {},
-  "hyperliquid_perp_quote_overrides": {
-    "HYPE-USD": "USDC",
-    "PURR-USD": "USDC"
-  }
+  "base_aliases": {}
 }

@@ -37,7 +37,7 @@ src/hyperl_binance/
 ## 市场范围与规则
 
 - Hyperliquid 现货与默认 perp DEX；排除 HIP-3 Builder DEX。
-- Hyperliquid 默认永续价格按 USDT 计价、以 USDC 作保证金；保证金币不作为报价币。`HYPE-USD`、`PURR-USD` 按 USDC 计价并在配置中显式覆盖。
+- Hyperliquid 永续元数据只给出币种标识、不提供明确报价币；程序默认按 USDC 标准化，只有经过确认的例外才通过 `hyperliquid_perp_quote_overrides` 覆盖。价格统计会用 Binance 最新 USDC/USDT 现货 BBO 中间价折算为 USDT。
 - Binance 现货与 USDⓈ-M 永续；仅筛选 USDT、USDC 报价市场，不取币本位交割合约。
 - 基础资产先按完全相同的名称配对；没有精确匹配时，才尝试名称包含关系（例如 `USOL` 与 `SOL`）。包含关系只生成候选，必须等两边新鲜 BBO 到达并按 Binance 最新 USDC/USDT 汇率换算后，价格偏差不超过 1% 才进入统计；超过 1% 记为 `base_price_mismatch`，不计为有效路线。`base_aliases` 仅保留给少数无法通过包含关系识别的例外，不需要逐个维护常见 `U*` 资产。
 - 24h quote turnover 门槛按交易所和市场类型分别配置：默认 HL 现货/永续各 500,000 USDT 等值，Binance 现货/永续各 5,000,000 USDT 等值。USDC 成交额暂按 1 USDT 估算用于市场初筛；价差计算统一使用 Binance 最新且新鲜的 USDC/USDT 现货 BBO 中间价换算，HL 与 Binance 的 USDC 报价共用该汇率。

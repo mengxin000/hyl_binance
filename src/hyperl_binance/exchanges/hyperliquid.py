@@ -76,11 +76,11 @@ def _discover_hyperliquid(config: MarketConfig) -> tuple[list[Instrument], dict[
                 coin = str(market.get("name", "")).upper()
                 if not coin or market.get("isDelisted") or ":" in coin:
                     continue
-                # Default DEX linear perps are USDT-denominated. The documented
-                # HYPE-USD and PURR-USD markets are USDC-denominated exceptions.
-                # Only explicitly listed -USD markets are USDC quoted; other
-                # default DEX perps are USDT quoted. Never infer HIP-3 symbols.
-                quote = str(overrides.get(coin, "USDT")).upper()
+                # Hyperliquid perp metadata identifies the instrument by coin and
+                # does not provide a quote asset. Normalize the default DEX perps
+                # as USDC; use config overrides only for explicitly verified
+                # exceptions. Never infer HIP-3 symbols.
+                quote = str(overrides.get(coin, "USDC")).upper()
                 if quote not in config.quote_assets:
                     continue
                 base = coin[:-4] if coin.endswith("-USD") else coin
