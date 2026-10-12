@@ -4,5 +4,6 @@
   "hyperliquid_min_perp_volume_usdt": 2000000,
   "binance_min_spot_volume_usdt": 5000000,
   "binance_min_perp_volume_usdt": 10000000,
+  "binance_price_min_usdt": 0.01,
   "base_aliases": {}
 }

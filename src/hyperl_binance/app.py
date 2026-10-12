@@ -8,7 +8,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config.settings import RuntimeConfig, load_config_managers
-from .domain.screener import build_routes, calculate_snapshot, conversion_rates
+from .domain.screener import (
+    binance_price_filter_reason,
+    build_routes,
+    calculate_snapshot,
+    conversion_rates,
+)
 from .domain.statistics import RouteHistory
 from .exchanges.discovery import discover_markets
 from .market_data.feed import PublicFeed
@@ -96,16 +101,30 @@ async def run() -> None:
     discovered_counts: dict[str, int] = {}
     qualified_counts: dict[str, int] = {}
     direction_counts: dict[str, int] = {}
+    retained_categories: set[tuple[str, str]] = set()
     page_index = 0
     last_discovery = last_render = last_persist = last_diag = 0.0
     last_funding_sample = last_funding_cleanup = 0.0
     try:
         while True:
             loop_time = time.monotonic()
+            old_market_config = market_manager.current
             market_changed = market_manager.reload()
             for manager in (*stat_managers.values(), runtime_manager):
                 manager.reload()
-            if market_changed:
+            discovery_fields = (
+                "quote_assets",
+                "hyperliquid_min_spot_volume_usdt",
+                "hyperliquid_min_perp_volume_usdt",
+                "binance_min_spot_volume_usdt",
+                "binance_min_perp_volume_usdt",
+                "base_aliases",
+                "hyperliquid_perp_quote_overrides",
+            )
+            if market_changed and any(
+                getattr(old_market_config, field) != getattr(market_manager.current, field)
+                for field in discovery_fields
+            ):
                 last_discovery = 0.0
             new_runtime = runtime_manager.current
             if new_runtime != runtime:
@@ -117,17 +136,39 @@ async def run() -> None:
                 )
             if loop_time - last_discovery >= runtime.market_refresh_seconds or not instruments:
                 result = await asyncio.to_thread(discover_markets, market_manager.current)
-                instruments, errors = (
-                    result.instruments,
-                    {
-                        **result.errors,
-                        **{
-                            m.path.name: m.error
-                            for m in (market_manager, runtime_manager, *stat_managers.values())
-                            if m.error
-                        },
+                discovered_instruments = list(result.instruments)
+                retained_categories.clear()
+                failed_categories = {
+                    "hyperliquid_spot_metadata": ("hyperliquid", "spot"),
+                    "hyperliquid_perp_metadata": ("hyperliquid", "perp"),
+                    "binance_spot_metadata": ("binance", "spot"),
+                    "binance_perp_metadata": ("binance", "perp"),
+                }
+                # A transient REST/TLS failure must not erase a previously
+                # discovered market category and its working subscriptions.
+                for error_key, category_key in failed_categories.items():
+                    cached = [
+                        item
+                        for item in instruments
+                        if (item.venue, item.kind) == category_key
+                    ]
+                    if error_key in result.errors and cached:
+                        discovered_instruments = [
+                            item
+                            for item in discovered_instruments
+                            if (item.venue, item.kind) != category_key
+                        ]
+                        discovered_instruments.extend(cached)
+                        retained_categories.add(category_key)
+                instruments = tuple(discovered_instruments)
+                errors = {
+                    **result.errors,
+                    **{
+                        m.path.name: m.error
+                        for m in (market_manager, runtime_manager, *stat_managers.values())
+                        if m.error
                     },
-                )
+                }
                 routes = build_routes(instruments, market_manager.current)
                 category_counts = {
                     category: sum(route.category == category for route in routes)
@@ -269,7 +310,13 @@ async def run() -> None:
                         )
                     history.config = cfg
                     history.quantile_refresh_seconds = runtime.quantile_refresh_seconds
-                last_discovery = loop_time
+                metadata_retry_seconds = 30.0
+                if any(key in result.errors for key in failed_categories):
+                    last_discovery = loop_time - max(
+                        runtime.market_refresh_seconds - metadata_retry_seconds, 0.0
+                    )
+                else:
+                    last_discovery = loop_time
             elif errors:
                 errors = {
                     **errors,
@@ -289,12 +336,20 @@ async def run() -> None:
             valid_by_direction: Counter[str] = Counter()
             invalid_by_direction: dict[str, Counter[str]] = {}
             valid_route_ids: set[str] = set()
+            price_excluded_route_ids: set[str] = set()
             # Evaluate each route once per sample tick. Missing or asynchronous quotes
             # are counted by reason for diagnosis and never fed into statistics.
             for route in routes:
                 snapshot, reason = calculate_snapshot(
                     route, quotes, rates, now, runtime.quote_max_age_ms / 1000
                 )
+                if snapshot:
+                    price_reason = binance_price_filter_reason(
+                        snapshot, market_manager.current
+                    )
+                    if price_reason:
+                        snapshot, reason = None, price_reason
+                        price_excluded_route_ids.add(route.route_id)
                 if snapshot:
                     if snapshot.receive_skew_ms > runtime.quote_match_tolerance_ms:
                         skew_over_tolerance += 1
@@ -466,12 +521,19 @@ async def run() -> None:
                     and 0 <= now - quote.received_mono <= runtime.quote_max_age_ms / 1000
                 )
                 status = f"WS活跃 {feed.counters.get('active_connections', 0)} | 建连累计 {feed.counters.get('connection_opens', 0)} | 重连 {feed.counters.get('reconnects', 0)} | 更新 {feed.counters.get('updates', 0)} | 当前页有效 {page_valid}/{category_counts.get(category, 0)} | 候选 SS/SP/PP {category_counts['spot_spot']}/{category_counts['spot_perp']}/{category_counts['perp_perp']} | HL现货有新鲜报价 {hl_spot_quotes} | H现×B永 {direction_counts.get('h_spot_b_perp', 0)}"
+                price_min = market_manager.current.binance_price_min_usdt
+                price_min_label = f"≥{price_min:g}" if price_min is not None else "不限"
                 market_status = (
                     "发现/过成交量门槛（USDT/USDC范围）"
                     f" HL现货 {discovered_counts.get('hyperliquid_spot', 0)}/{qualified_counts.get('hyperliquid_spot', 0)}"
+                    f"{'(缓存)' if ('hyperliquid', 'spot') in retained_categories else ''}"
                     f" HL永续 {discovered_counts.get('hyperliquid_perp', 0)}/{qualified_counts.get('hyperliquid_perp', 0)}"
+                    f"{'(缓存)' if ('hyperliquid', 'perp') in retained_categories else ''}"
                     f" Binance现货 {discovered_counts.get('binance_spot', 0)}/{qualified_counts.get('binance_spot', 0)}"
+                    f"{'(缓存)' if ('binance', 'spot') in retained_categories else ''}"
                     f" Binance永续 {discovered_counts.get('binance_perp', 0)}/{qualified_counts.get('binance_perp', 0)}"
+                    f"{'(缓存)' if ('binance', 'perp') in retained_categories else ''}"
+                    f" | Binance价格下限USDT {price_min_label}"
                 )
                 active_route_ids = {route.route_id for route in routes}
                 render(
@@ -486,6 +548,7 @@ async def run() -> None:
                     stat_managers[category].current.top,
                     fresh_route_ids=valid_route_ids,
                     market_status=market_status,
+                    excluded_route_ids=price_excluded_route_ids,
                 )
                 last_render = loop_time
             if _read_k():

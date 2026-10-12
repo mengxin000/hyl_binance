@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
@@ -38,9 +39,17 @@ def get_binance_json(session: requests.Session, hosts: tuple[str, ...], path: st
 
 
 def hl_info(session: requests.Session, request: dict[str, Any]) -> Any:
-    response = session.post("https://api.hyperliquid.xyz/info", json=request, timeout=(5, 30))
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(3):
+        try:
+            response = session.post(
+                "https://api.hyperliquid.xyz/info", json=request, timeout=(5, 30)
+            )
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt == 2:
+                raise
+            time.sleep(0.25 * (attempt + 1))
 
 
 def optional_float(value: Any) -> float | None:

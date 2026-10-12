@@ -18,6 +18,7 @@ class MarketConfig:
     hyperliquid_min_perp_volume_usdt: float = 500_000
     binance_min_spot_volume_usdt: float = 5_000_000
     binance_min_perp_volume_usdt: float = 5_000_000
+    binance_price_min_usdt: float | None = None
     base_aliases: dict[str, str] | None = None
     hyperliquid_perp_quote_overrides: dict[str, str] | None = None
 
@@ -32,6 +33,9 @@ class MarketConfig:
         )
         if any(value < 0 for value in thresholds):
             raise ValueError("成交额门槛不能小于 0")
+        price_min = self.binance_price_min_usdt
+        if price_min is not None and price_min < 0:
+            raise ValueError("binance_price_min_usdt 不能小于 0")
         for field_name in ("base_aliases", "hyperliquid_perp_quote_overrides"):
             value = getattr(self, field_name) or {}
             if not isinstance(value, dict) or any(

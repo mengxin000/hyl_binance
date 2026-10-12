@@ -1,5 +1,5 @@
 {
-  "top": 40,
+  "top": 50,
   "total_window_samples": 86400,
   "long_window_samples": 28800,
   "short_window_samples": 10800,

@@ -41,6 +41,7 @@ src/hyperl_binance/
 - Binance 现货与 USDⓈ-M 永续；仅筛选 USDT、USDC 报价市场，不取币本位交割合约。
 - 基础资产先按完全相同的名称配对；没有精确匹配时，才尝试名称包含关系（例如 `USOL` 与 `SOL`）。包含关系只生成候选，必须等两边新鲜 BBO 到达并按 Binance 最新 USDC/USDT 汇率换算后，价格偏差不超过 1% 才进入统计；超过 1% 记为 `base_price_mismatch`，不计为有效路线。`base_aliases` 仅保留给少数无法通过包含关系识别的例外，不需要逐个维护常见 `U*` 资产。
 - 24h quote turnover 门槛按交易所和市场类型分别配置：默认 HL 现货/永续各 500,000 USDT 等值，Binance 现货/永续各 5,000,000 USDT 等值。USDC 成交额暂按 1 USDT 估算用于市场初筛；价差计算统一使用 Binance 最新且新鲜的 USDC/USDT 现货 BBO 中间价换算，HL 与 Binance 的 USDC 报价共用该汇率。
+- `config/market.json` 的 `binance_price_min_usdt` 可热加载设置 Binance 标的最低价格；比较值使用 Binance 行情折算后的 USDT mid，低于下限的路线不参与统计和列表。`null` 表示不限制；只修改价格下限不会触发市场 REST 元数据重拉。
 - 统计价差：同类市场按 HL/Binance - 1；现货/永续按永续/现货 - 1。终端另外显示两种方向的 BBO 可成交价差（HL 买/BN 卖、BN 买/HL 卖）。这些是最优档毛价差，未扣手续费，也不代表大额可成交价差。两边 BBO 分别须在 1 秒内更新；两条消息的接收时间差仅用于诊断，不作为路线硬过滤条件。
 - 只用 BBO；暂不重建 L2 深度、不做扫单、排队位置或延迟模拟。统计采样与窗口在 `config/basis_*.json` 中调整，JSON 修改会热加载。
 - 原始行情和样本仅放内存；重启后重新采样。持久化每条路线状态、机会事件和网络诊断于 `data/`。

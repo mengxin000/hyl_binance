@@ -174,3 +174,11 @@ def calculate_snapshot(
         h_age * 1000,
         b_age * 1000,
     ), "ok"
+
+
+def binance_price_filter_reason(snapshot: SpreadSnapshot, config: MarketConfig) -> str | None:
+    """Filter routes below the Binance leg's quote-converted USDT mid price."""
+    price = snapshot.binance_mid_usdt
+    if config.binance_price_min_usdt is not None and price < config.binance_price_min_usdt:
+        return "binance_price_out_of_range"
+    return None

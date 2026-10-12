@@ -276,13 +276,16 @@ def render(
     top: int = 40,
     fresh_route_ids: set[str] | None = None,
     market_status: str = "",
+    excluded_route_ids: set[str] | None = None,
 ) -> None:
     fresh_route_ids = fresh_route_ids or set()
+    excluded_route_ids = excluded_route_ids or set()
     rows = [
         h
         for h in histories.values()
         if h.current
         and h.current.route.category == page
+        and h.current.route.route_id not in excluded_route_ids
         and h.config.sigma_multiplier * h.stats.sigma_bps >= h.config.min_k_sigma_bps
     ]
     rows.sort(
@@ -337,7 +340,11 @@ def render(
 
     if not rows:
         page_histories = [
-            h for h in histories.values() if h.current and h.current.route.category == page
+            h
+            for h in histories.values()
+            if h.current
+            and h.current.route.category == page
+            and h.current.route.route_id not in excluded_route_ids
         ]
         if page_histories:
             lines.append("当前页路线尚未达到配置的 2σ 波动筛选门槛。")
