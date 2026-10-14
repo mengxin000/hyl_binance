@@ -49,7 +49,7 @@ class Storage:
                 path = self.root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if (
-                    relative.endswith("network_pipeline.jsonl")
+                    relative.endswith(("network_pipeline.jsonl", "observations.jsonl"))
                     and path.exists()
                     and path.stat().st_size >= self.max_log_bytes
                 ):

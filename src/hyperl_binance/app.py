@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
-from .config.settings import RuntimeConfig, load_config_managers
+from .config.settings import CONFIG_DIR, ConfigManager, RuntimeConfig, load_config_managers
 from .domain.screener import (
     binance_price_filter_reason,
     build_routes,
@@ -20,6 +20,9 @@ from .market_data.feed import PublicFeed
 from .paths import project_path
 from .persistence.storage import Storage
 from .presentation.terminal import PAGES, render
+from .simulation.config import ScoreConfig, SimulationConfig
+from .simulation.engine import SignalPolicy, execution_legs
+from .simulation.service import SimulationService
 
 FUNDING_HISTORY_SECONDS = 30 * 24 * 60 * 60
 FUNDING_SAMPLE_INTERVAL_SECONDS = 60 * 60
@@ -84,15 +87,24 @@ async def run() -> None:
         "perp_perp": perp_perp_manager,
     }
     runtime: RuntimeConfig = runtime_manager.current
+    simulation_manager = ConfigManager(CONFIG_DIR / "simulation.json", SimulationConfig)
+    score_manager = ConfigManager(CONFIG_DIR / "score.json", ScoreConfig)
     storage = Storage(project_path(runtime.data_directory), runtime.network_log_max_bytes)
     storage.start()
+    simulation = SimulationService(
+        simulation_manager.current,
+        lambda record: storage.emit("simulation/observations.jsonl", {"ts": time.time(), **record}),
+    )
+    simulation.start()
     funding_history = _load_funding_history(storage.root, time.time())
     _prune_funding_history(storage.root, time.time())
     feed = PublicFeed(
         runtime.binance_symbols_per_connection,
         runtime.hyperliquid_subscriptions_per_connection,
         runtime.raw_coalesce_interval_ms,
+        event_sink=simulation.ingest,
     )
+    feed.configure_depth(simulation_manager.current.enabled)
     feed.start()
     histories: dict[str, RouteHistory] = {}
     errors: dict[str, str] = {}
@@ -110,8 +122,17 @@ async def run() -> None:
             loop_time = time.monotonic()
             old_market_config = market_manager.current
             market_changed = market_manager.reload()
-            for manager in (*stat_managers.values(), runtime_manager):
+            for manager in (
+                *stat_managers.values(),
+                runtime_manager,
+                simulation_manager,
+                score_manager,
+            ):
                 manager.reload()
+            feed.configure_depth(
+                simulation_manager.current.enabled,
+                frozenset(execution_legs(route)[1].key for route in routes),
+            )
             discovery_fields = (
                 "quote_assets",
                 "hyperliquid_min_spot_volume_usdt",
@@ -148,9 +169,7 @@ async def run() -> None:
                 # discovered market category and its working subscriptions.
                 for error_key, category_key in failed_categories.items():
                     cached = [
-                        item
-                        for item in instruments
-                        if (item.venue, item.kind) == category_key
+                        item for item in instruments if (item.venue, item.kind) == category_key
                     ]
                     if error_key in result.errors and cached:
                         discovered_instruments = [
@@ -170,6 +189,10 @@ async def run() -> None:
                     },
                 }
                 routes = build_routes(instruments, market_manager.current)
+                feed.configure_depth(
+                    simulation_manager.current.enabled,
+                    frozenset(execution_legs(route)[1].key for route in routes),
+                )
                 category_counts = {
                     category: sum(route.category == category for route in routes)
                     for category in ("spot_spot", "spot_perp", "perp_perp")
@@ -219,9 +242,7 @@ async def run() -> None:
                     item.key: [route for route in routes if route.hyperliquid.key == item.key]
                     for item in eligible[("hyperliquid", "spot")]
                 }
-                hl_perp_eligible_keys = {
-                    item.key for item in eligible[("hyperliquid", "perp")]
-                }
+                hl_perp_eligible_keys = {item.key for item in eligible[("hyperliquid", "perp")]}
                 hl_perp_routes = {
                     item.key: [route for route in routes if route.hyperliquid.key == item.key]
                     for item in eligible[("hyperliquid", "perp")]
@@ -274,10 +295,7 @@ async def run() -> None:
                                     for route in hl_spot_routes[item.key]
                                 ),
                                 "binance_candidate_symbols": sorted(
-                                    {
-                                        route.binance.symbol
-                                        for route in hl_spot_routes[item.key]
-                                    }
+                                    {route.binance.symbol for route in hl_spot_routes[item.key]}
                                 ),
                                 "price_validation_required": any(
                                     route.requires_base_price_validation
@@ -344,9 +362,7 @@ async def run() -> None:
                     route, quotes, rates, now, runtime.quote_max_age_ms / 1000
                 )
                 if snapshot:
-                    price_reason = binance_price_filter_reason(
-                        snapshot, market_manager.current
-                    )
+                    price_reason = binance_price_filter_reason(snapshot, market_manager.current)
                     if price_reason:
                         snapshot, reason = None, price_reason
                         price_excluded_route_ids.add(route.route_id)
@@ -375,6 +391,21 @@ async def run() -> None:
                     invalid[reason] = invalid.get(reason, 0) + 1
                     direction = f"h_{route.hyperliquid.kind}_b_{route.binance.kind}"
                     invalid_by_direction.setdefault(direction, Counter())[reason] += 1
+            policy_time = time.monotonic_ns()
+            policies = {
+                route.route_id: SignalPolicy(
+                    histories[route.route_id].stats.mean_bps,
+                    stat_managers[route.category].current.open_threshold_bps,
+                    stat_managers[route.category].current.close_threshold_bps,
+                    policy_time,
+                )
+                for route in routes
+                if histories[route.route_id].stats.sample_count >= 2
+            }
+            simulation.configure(
+                routes, instruments, policies, simulation_manager.current, market_manager.current
+            )
+            simulation_view = simulation.snapshot()
             wall_now = time.time()
             if wall_now - last_funding_sample >= FUNDING_SAMPLE_INTERVAL_SECONDS:
                 day = time.strftime("%Y-%m-%d", time.gmtime(wall_now))
@@ -484,11 +515,26 @@ async def run() -> None:
                     ),
                     "hl_quote_updates_spot": feed.counters.get("hl_quote_updates_spot", 0),
                     "queue_dropped": storage.dropped,
+                    "simulation_queue_dropped": simulation.queue_dropped,
+                    "simulation_depth_updates": feed.counters.get("simulation_depth_updates", 0),
+                    "simulation_samples": sum(s["samples"] for s in simulation_view.values()),
+                    "simulation_invalid": sum(s["invalid"] for s in simulation_view.values()),
+                    "simulation_error": simulation.last_error,
                     "last_error": feed.last_error,
                 }
                 storage.emit("diagnostics/network_pipeline.jsonl", status)
                 last_diag = loop_time
             if loop_time - last_persist >= runtime.persist_interval_seconds:
+                storage.save_state(
+                    "simulation/state.json",
+                    {
+                        "saved_at": time.time(),
+                        "config": asdict(simulation_manager.current),
+                        "score_config": asdict(score_manager.current),
+                        "routes": simulation_view,
+                        "queue_dropped": simulation.queue_dropped,
+                    },
+                )
                 for route_id, history in histories.items():
                     if history.current:
                         route = history.current.route
@@ -509,8 +555,7 @@ async def run() -> None:
                 page_valid = sum(
                     1
                     for route in routes
-                    if route.category == category
-                    and route.route_id in valid_route_ids
+                    if route.category == category and route.route_id in valid_route_ids
                 )
                 hl_spot_quotes = sum(
                     1
@@ -544,11 +589,22 @@ async def run() -> None:
                         if route_id in active_route_ids
                     },
                     status + (f" | {feed.last_error}" if feed.last_error else ""),
-                    errors,
+                    {
+                        **errors,
+                        **{
+                            m.path.name: m.error
+                            for m in (simulation_manager, score_manager)
+                            if m.error
+                        },
+                        **({"simulation": simulation.last_error} if simulation.last_error else {}),
+                    },
                     stat_managers[category].current.top,
                     fresh_route_ids=valid_route_ids,
                     market_status=market_status,
                     excluded_route_ids=price_excluded_route_ids,
+                    simulations=simulation_view,
+                    simulation_config=simulation_manager.current,
+                    score_config=score_manager.current,
                 )
                 last_render = loop_time
             if _read_k():
@@ -556,6 +612,7 @@ async def run() -> None:
             await asyncio.sleep(max(0.02, runtime.sample_interval_ms / 1000))
     finally:
         feed.stop()
+        simulation.stop()
         storage.stop()
 
 

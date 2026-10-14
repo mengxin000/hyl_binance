@@ -8,6 +8,8 @@ from collections.abc import Callable
 
 from ..domain.models import Category, Instrument, SpreadRoute
 from ..domain.statistics import RouteHistory
+from ..simulation.config import ScoreConfig, SimulationConfig
+from ..simulation.score import score_routes
 
 PAGES: tuple[Category, ...] = ("spot_spot", "spot_perp", "perp_perp")
 TITLES = {"spot_spot": "现货 / 现货", "spot_perp": "现货 / 永续", "perp_perp": "永续 / 永续"}
@@ -277,9 +279,13 @@ def render(
     fresh_route_ids: set[str] | None = None,
     market_status: str = "",
     excluded_route_ids: set[str] | None = None,
+    simulations: dict[str, dict] | None = None,
+    simulation_config: SimulationConfig | None = None,
+    score_config: ScoreConfig | None = None,
 ) -> None:
     fresh_route_ids = fresh_route_ids or set()
     excluded_route_ids = excluded_route_ids or set()
+    simulations = simulations or {}
     rows = [
         h
         for h in histories.values()
@@ -288,14 +294,75 @@ def render(
         and h.current.route.route_id not in excluded_route_ids
         and h.config.sigma_multiplier * h.stats.sigma_bps >= h.config.min_k_sigma_bps
     ]
+    scores = score_routes(
+        simulations,
+        {h.current.route.route_id: min(h.stats.open_count, h.stats.close_count) for h in rows},
+        score_config
+        if simulation_config and simulation_config.enabled and score_config
+        else ScoreConfig(enabled=False),
+        simulation_config.min_samples if simulation_config else 5,
+        time.monotonic_ns(),
+    )
     rows.sort(
         key=lambda h: (
+            h.current.route.route_id in scores,
+            scores.get(h.current.route.route_id, 0),
             min(h.stats.open_count, h.stats.close_count),
             h.stats.open_count + h.stats.close_count,
         ),
         reverse=True,
     )
     columns = _cols(page)
+    if simulation_config and simulation_config.enabled:
+
+        def observation(history):
+            return simulations.get(history.current.route.route_id, {})
+
+        def metric(history, field):
+            value = observation(history).get(field)
+            return "—" if value is None else f"{value:+.2f}"
+
+        columns.extend(
+            [
+                (
+                    10,
+                    "模拟N/异常",
+                    "滑点观测",
+                    "right",
+                    lambda n, h: (
+                        f"{observation(h).get('samples', 0)}/{observation(h).get('invalid', 0)}"
+                    ),
+                ),
+                (
+                    18,
+                    "延迟/深度·bps",
+                    "滑点观测",
+                    "right",
+                    lambda n, h: metric(h, "mean_delay_bps") + "/" + metric(h, "mean_depth_bps"),
+                ),
+                (
+                    18,
+                    "滑点均值/P95",
+                    "滑点观测·bps",
+                    "right",
+                    lambda n, h: (
+                        metric(h, "mean_total_slippage_bps") + "/" + metric(h, "p95_slippage_bps")
+                    ),
+                ),
+                (8, "费用·bps", "模拟手续费", "right", lambda n, h: metric(h, "mean_fee_bps")),
+                (
+                    8,
+                    "Score",
+                    "相对评分",
+                    "right",
+                    lambda n, h: (
+                        f"{scores[h.current.route.route_id]:.2f}"
+                        if h.current.route.route_id in scores
+                        else "—"
+                    ),
+                ),
+            ]
+        )
     title = "HYPERLIQUID × BINANCE | 公共行情价差筛选器"
     lines = [
         title,
@@ -308,12 +375,19 @@ def render(
         lines.append("发现错误：" + " | ".join(f"{k}={v}" for k, v in list(errors.items())[:3]))
 
     terminal_width = shutil.get_terminal_size(fallback=(180, 24)).columns
-    full_width = sum(width for width, *_ in columns) + 2 * (len(columns) - 1)
-    split = full_width > terminal_width
-    split_at = 8 if split else len(columns)
-    lines.extend(_header(columns[:split_at]))
-    if split:
-        lines.extend(_header(columns[split_at:]))
+    blocks = []
+    start, used = 0, 0
+    for index, (width, *_rest) in enumerate(columns):
+        budget = terminal_width - (4 if start else 0)
+        additional = width + (2 if index > start else 0)
+        if used + additional > budget and index > start:
+            blocks.append((start, index))
+            start, used = index, width
+        else:
+            used += additional
+    blocks.append((start, len(columns)))
+    for start, end in blocks:
+        lines.extend(("    " if start else "") + line for line in _header(columns[start:end]))
 
     for n, history in enumerate(rows[:top], 1):
         cells = [
@@ -322,21 +396,14 @@ def render(
         ]
         if history.current.route.route_id not in fresh_route_ids:
             cells[0] = f"~{n}"
-        first = "  ".join(
-            _cell(cells[index], width, align)
-            for index, (width, _header_text, _group, align, _format) in enumerate(
-                columns[:split_at]
-            )
-        )
-        lines.append(first)
-        if split:
-            continuation = "  ".join(
+        for start, end in blocks:
+            line = "  ".join(
                 _cell(cells[index], width, align)
                 for index, (width, _header_text, _group, align, _format) in enumerate(
-                    columns[split_at:], split_at
+                    columns[start:end], start
                 )
             )
-            lines.append("    " + continuation)
+            lines.append(("    " if start else "") + line)
 
     if not rows:
         page_histories = [
@@ -354,6 +421,16 @@ def render(
         f"刷新时间：{time.strftime('%H:%M:%S')}  |  成交额为 24h 统计；资费显示交易所公布费率，换算为 bps"
     )
     lines.append("榜内 ~序号表示本轮报价不新鲜，数值为最后一次有效快照；不计入“当前页有效”。")
+    if simulation_config and simulation_config.enabled:
+        lines.append(
+            f"滑点模拟 {simulation_config.order_notional_usdt:g}U | "
+            f"maker假定成交 {simulation_config.exchange_delay_ms:g}ms，"
+            f"taker追加延迟 {simulation_config.deal_delay_ms:g}ms | "
+            f"至少 {simulation_config.min_samples} 个有效样本评分；异常不计入均值。"
+        )
+        lines.append(
+            "滑点正值为成本、负值为改善；Score 为本页相对排序，未评分时沿用开/平次数排序。"
+        )
     if page == "spot_perp":
         lines.append(
             "现货/永续基差 = 折算为 USDT 后的永续 ask / 现货 bid - 1；成交额按市场报价币计。"

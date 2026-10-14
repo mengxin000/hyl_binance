@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from collections import Counter
 from math import ceil
 from typing import Callable
@@ -32,19 +33,35 @@ class HyperliquidBboStream:
         publish: Callable[[Instrument, float, float, int | None], bool],
         set_error: Callable[[str, str], None],
         clear_error: Callable[[str], None],
+        observe_quote: Callable | None = None,
+        observe_depth: Callable | None = None,
+        observe_reset: Callable | None = None,
     ) -> None:
         self.stop_event = stop_event
         self.counters = counters
         self.publish = publish
         self.set_error = set_error
         self.clear_error = clear_error
+        self.observe_quote, self.observe_depth, self.observe_reset = (
+            observe_quote,
+            observe_depth,
+            observe_reset,
+        )
+        self.depth_enabled = False
+        self.depth_keys: frozenset[str] | None = None
         self._isolated_coins: set[str] = set()
         self._subscription_failures: Counter[str] = Counter()
         self._universe_signature: frozenset[str] = frozenset()
 
     async def run(
-        self, instruments: tuple[Instrument, ...], subscriptions_per_connection: int
+        self,
+        instruments: tuple[Instrument, ...],
+        subscriptions_per_connection: int,
+        depth_enabled: bool = False,
+        depth_keys: frozenset[str] | None = None,
     ) -> None:
+        self.depth_enabled = depth_enabled
+        self.depth_keys = depth_keys
         by_coin: dict[str, Instrument] = {}
         coins_by_kind: dict[str, list[str]] = {"spot": [], "perp": []}
         for instrument in instruments:
@@ -138,6 +155,8 @@ class HyperliquidBboStream:
             error_message = ""
             pending_coin: str | None = None
             try:
+                if self.observe_reset:
+                    self.observe_reset(tuple(by_coin[coin] for coin in active_coins))
                 async with websockets.connect(
                     HL_WS,
                     ping_interval=None,
@@ -198,8 +217,9 @@ class HyperliquidBboStream:
                                     receiver_task.result()
                                 except Exception as exc:
                                     raise _SubscriptionFailed(
-                                        coin, f"connection closed before ack: "
-                                        f"{type(exc).__name__}: {exc}"
+                                        coin,
+                                        f"connection closed before ack: "
+                                        f"{type(exc).__name__}: {exc}",
                                     ) from exc
                                 raise _SubscriptionFailed(
                                     coin, "connection ended before subscription ack"
@@ -224,10 +244,31 @@ class HyperliquidBboStream:
                             if coin != active_coins[-1]:
                                 await asyncio.sleep(0.05)
 
+                        # Complete BBO acknowledgements first. A rejected optional
+                        # depth subscription must never be attributed to the next
+                        # BBO coin or trigger BBO coin isolation.
+                        if self.depth_enabled:
+                            for coin in active_coins:
+                                if (
+                                    self.depth_keys is not None
+                                    and by_coin[coin].key not in self.depth_keys
+                                ):
+                                    continue
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "method": "subscribe",
+                                            "subscription": {"type": "l2Book", "coin": coin},
+                                        }
+                                    )
+                                )
+                                await asyncio.sleep(0.05)
+
                     async def receive() -> None:
                         nonlocal pending_coin
                         try:
                             async for raw in ws:
+                                received_ns = time.monotonic_ns()
                                 msg = json.loads(raw)
                                 channel = msg.get("channel")
                                 if channel == "error":
@@ -235,7 +276,8 @@ class HyperliquidBboStream:
                                     detail = str(msg.get("data", "unknown subscription error"))
                                     if pending_coin is not None:
                                         raise _SubscriptionFailed(
-                                            pending_coin, f"server rejected subscription: {detail[:240]}"
+                                            pending_coin,
+                                            f"server rejected subscription: {detail[:240]}",
                                         )
                                     self.set_error(error_key, f"subscription: {detail[:240]}")
                                     continue
@@ -252,6 +294,22 @@ class HyperliquidBboStream:
                                     )
                                     if subscription.get("type") == "bbo":
                                         subscription_acks.put_nowait(subscription)
+                                    continue
+                                if channel == "l2Book":
+                                    data = msg.get("data", {})
+                                    inst = by_coin.get(str(data.get("coin", "")))
+                                    if inst and self.observe_depth:
+                                        try:
+                                            levels = data["levels"]
+                                            self.observe_depth(
+                                                inst,
+                                                [(x["px"], x["sz"]) for x in levels[0]],
+                                                [(x["px"], x["sz"]) for x in levels[1]],
+                                                received_ns,
+                                                int(data.get("time", 0)) or None,
+                                            )
+                                        except (KeyError, TypeError, ValueError, IndexError):
+                                            self.counters["parse_errors"] += 1
                                     continue
                                 if channel != "bbo":
                                     continue
@@ -276,6 +334,16 @@ class HyperliquidBboStream:
                                         inst, bid, ask, int(data.get("time", 0)) or None
                                     ):
                                         self.counters[f"hl_quote_updates_{inst.kind}"] += 1
+                                        if self.observe_quote:
+                                            self.observe_quote(
+                                                inst,
+                                                bid,
+                                                ask,
+                                                float(bbo[0]["sz"]),
+                                                float(bbo[1]["sz"]),
+                                                received_ns,
+                                                int(data.get("time", 0)) or None,
+                                            )
                                 except (KeyError, TypeError, ValueError):
                                     self.counters["parse_errors"] += 1
                         finally:
@@ -316,9 +384,7 @@ class HyperliquidBboStream:
                     finally:
                         receiver_task.cancel()
                         heartbeat_task.cancel()
-                        await asyncio.gather(
-                            receiver_task, heartbeat_task, return_exceptions=True
-                        )
+                        await asyncio.gather(receiver_task, heartbeat_task, return_exceptions=True)
             except asyncio.CancelledError:
                 self.clear_error(error_key)
                 raise
@@ -334,6 +400,8 @@ class HyperliquidBboStream:
             except Exception as exc:
                 error_message = f"{type(exc).__name__}: {exc}"
             finally:
+                if self.observe_reset:
+                    self.observe_reset(tuple(by_coin[coin] for coin in active_coins))
                 if counted:
                     self.counters["active_connections"] -= 1
                     self.counters["hl_active_connections"] -= 1

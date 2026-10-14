@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "slippage_weight": 0.8,
+  "opportunity_weight": 0.2,
+  "tail_weight": 0.5,
+  "max_sample_age_seconds": 300
+}

@@ -14,5 +14,7 @@ data/
 .idea/
 .vscode/
 .env
-./test/
+test
+tests
+
 

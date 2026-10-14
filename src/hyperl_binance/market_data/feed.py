@@ -4,8 +4,11 @@ import asyncio
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
+from math import isfinite
 from typing import Any
 
+from ..domain.market_events import DepthEvent, MarketEvent, QuoteEvent, StreamReset
 from ..domain.models import BookQuote, Instrument
 from .binance_stream import BinanceBookTickerStream
 from .hyperliquid_stream import HyperliquidBboStream
@@ -15,11 +18,18 @@ class PublicFeed:
     """Independent async WS thread; publish only latest quote per instrument."""
 
     def __init__(
-        self, symbols_per_connection: int, hl_subscriptions_per_connection: int, coalesce_ms: int
+        self,
+        symbols_per_connection: int,
+        hl_subscriptions_per_connection: int,
+        coalesce_ms: int,
+        event_sink: Callable[[MarketEvent], None] | None = None,
     ) -> None:
         self.symbols_per_connection = symbols_per_connection
         self.hl_subscriptions_per_connection = hl_subscriptions_per_connection
         self.coalesce_seconds = coalesce_ms / 1000
+        self.event_sink = event_sink
+        self.depth_enabled = False
+        self.depth_keys: frozenset[str] = frozenset()
         self._quotes: dict[str, BookQuote] = {}
         self._lock = threading.Lock()
         self._desired: tuple[Instrument, ...] = ()
@@ -30,10 +40,24 @@ class PublicFeed:
         self._errors: dict[str, str] = {}
         self._error_lock = threading.Lock()
         self._binance_stream = BinanceBookTickerStream(
-            self._stop, self.counters, self._publish, self._set_error, self._clear_error
+            self._stop,
+            self.counters,
+            self._publish,
+            self._set_error,
+            self._clear_error,
+            self._observe_quote,
+            self._observe_depth,
+            self._observe_reset,
         )
         self._hyperliquid_stream = HyperliquidBboStream(
-            self._stop, self.counters, self._publish, self._set_error, self._clear_error
+            self._stop,
+            self.counters,
+            self._publish,
+            self._set_error,
+            self._clear_error,
+            self._observe_quote,
+            self._observe_depth,
+            self._observe_reset,
         )
 
     def start(self) -> None:
@@ -71,6 +95,42 @@ class PublicFeed:
         with self._lock:
             return dict(self._quotes)
 
+    def configure_depth(self, enabled: bool, keys: frozenset[str] = frozenset()) -> None:
+        if enabled != self.depth_enabled or keys != self.depth_keys:
+            self.depth_enabled = enabled
+            self.depth_keys = keys
+            self._wake.set()
+
+    def _observe_quote(self, instrument, bid, ask, bid_qty, ask_qty, received_ns, source_ms):
+        if (
+            self.event_sink
+            and all(isfinite(v) for v in (bid, ask, bid_qty, ask_qty))
+            and (0 < bid <= ask and min(bid_qty, ask_qty) >= 0)
+        ):
+            self.event_sink(
+                QuoteEvent(instrument, bid, ask, bid_qty, ask_qty, received_ns, source_ms)
+            )
+
+    def _observe_depth(self, instrument, bids, asks, received_ns, source_ms):
+        if not self.event_sink or not self.depth_enabled:
+            return
+        bids = tuple(sorted(((float(p), float(q)) for p, q in bids if float(q) > 0), reverse=True))
+        asks = tuple(sorted((float(p), float(q)) for p, q in asks if float(q) > 0))
+        if (
+            not bids
+            or not asks
+            or bids[0][0] > asks[0][0]
+            or any(not isfinite(v) or v <= 0 for level in (*bids, *asks) for v in level)
+        ):
+            self.counters["simulation_invalid_depth"] += 1
+            return
+        self.event_sink(DepthEvent(instrument, bids, asks, received_ns, source_ms))
+        self.counters["simulation_depth_updates"] += 1
+
+    def _observe_reset(self, instruments):
+        if self.event_sink:
+            self.event_sink(StreamReset(tuple(i.key for i in instruments), time.monotonic_ns()))
+
     def _thread_main(self) -> None:
         asyncio.run(self._run())
 
@@ -96,6 +156,8 @@ class PublicFeed:
                         kind,
                         tuple(i for i in rows if i.venue == "binance" and i.kind == kind),
                         self.symbols_per_connection,
+                        self.depth_enabled,
+                        self.depth_keys,
                     )
                 )
                 for kind in ("spot", "perp")
@@ -105,6 +167,8 @@ class PublicFeed:
                     self._hyperliquid_stream.run(
                         tuple(i for i in rows if i.venue == "hyperliquid"),
                         self.hl_subscriptions_per_connection,
+                        self.depth_enabled,
+                        self.depth_keys,
                     )
                 )
             )
