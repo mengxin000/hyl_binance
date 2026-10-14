@@ -6,6 +6,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 
+from ..config.settings import StatisticsConfig
 from ..domain.models import Category, Instrument, SpreadRoute
 from ..domain.statistics import RouteHistory
 from ..simulation.config import ScoreConfig, SimulationConfig
@@ -240,13 +241,6 @@ def _cols(page: Category) -> list[tuple[int, str, str, str, Callable[[int, Route
     columns.extend(
         [
             (
-                9,
-                "开/平",
-                "机会",
-                "right",
-                lambda n, h: f"{h.stats.open_count}/{h.stats.close_count}",
-            ),
-            (
                 20,
                 "HL/B/差",
                 "报价年龄 · ms",
@@ -282,6 +276,7 @@ def render(
     simulations: dict[str, dict] | None = None,
     simulation_config: SimulationConfig | None = None,
     score_config: ScoreConfig | None = None,
+    statistics_config: StatisticsConfig | None = None,
 ) -> None:
     fresh_route_ids = fresh_route_ids or set()
     excluded_route_ids = excluded_route_ids or set()
@@ -296,22 +291,29 @@ def render(
     ]
     scores = score_routes(
         simulations,
-        {h.current.route.route_id: min(h.stats.open_count, h.stats.close_count) for h in rows},
+        {h.current.route.route_id for h in rows},
         score_config
         if simulation_config and simulation_config.enabled and score_config
         else ScoreConfig(enabled=False),
         simulation_config.min_samples if simulation_config else 5,
         time.monotonic_ns(),
     )
-    rows.sort(
-        key=lambda h: (
-            h.current.route.route_id in scores,
-            scores.get(h.current.route.route_id, 0),
-            min(h.stats.open_count, h.stats.close_count),
-            h.stats.open_count + h.stats.close_count,
-        ),
-        reverse=True,
-    )
+
+    def sort_key(history):
+        rid = history.current.route.route_id
+        result = simulations.get(rid, {})
+        profit = result.get("profit_index")
+        return (
+            -int(rid in scores),
+            -scores.get(rid, 0),
+            -int(profit is not None),
+            -(profit if profit is not None else 0),
+            -result.get("paired_samples", 0),
+            -result.get("samples", 0),
+            _route_name(history.current.route),
+        )
+
+    rows.sort(key=sort_key)
     columns = _cols(page)
     if simulation_config and simulation_config.enabled:
 
@@ -322,15 +324,34 @@ def render(
             value = observation(history).get(field)
             return "—" if value is None else f"{value:+.2f}"
 
+        def trigger_lines(history):
+            trigger = observation(history).get("trigger") or {}
+            if trigger.get("status") == "warming_up":
+                return f"预热{trigger['sample_count']}/{trigger['min_samples']}"
+            if trigger.get("status") == "flat_distribution":
+                return "分布零宽"
+            if trigger.get("status") != "ready":
+                return "—"
+            return f"{trigger['open_bps']:+.2f}/{trigger['close_bps']:+.2f}"
+
         columns.extend(
             [
                 (
-                    10,
-                    "模拟N/异常",
+                    22,
+                    "开线/平线·bps",
+                    "实际触发线",
+                    "right",
+                    lambda n, h: trigger_lines(h),
+                ),
+                (
+                    14,
+                    "模拟开/平/异常",
                     "滑点观测",
                     "right",
                     lambda n, h: (
-                        f"{observation(h).get('samples', 0)}/{observation(h).get('invalid', 0)}"
+                        f"{observation(h).get('open_samples', 0)}/"
+                        f"{observation(h).get('close_samples', 0)}/"
+                        f"{observation(h).get('invalid', 0)}"
                     ),
                 ),
                 (
@@ -350,6 +371,27 @@ def render(
                     ),
                 ),
                 (8, "费用·bps", "模拟手续费", "right", lambda n, h: metric(h, "mean_fee_bps")),
+                (
+                    11,
+                    "开edge·bps",
+                    "模拟净edge",
+                    "right",
+                    lambda n, h: metric(h, "mean_open_net_edge_bps"),
+                ),
+                (
+                    11,
+                    "平edge·bps",
+                    "模拟净edge",
+                    "right",
+                    lambda n, h: metric(h, "mean_close_net_edge_bps"),
+                ),
+                (
+                    12,
+                    "Profit指数",
+                    "累计净edge指数",
+                    "right",
+                    lambda n, h: metric(h, "profit_index"),
+                ),
                 (
                     8,
                     "Score",
@@ -422,15 +464,51 @@ def render(
     )
     lines.append("榜内 ~序号表示本轮报价不新鲜，数值为最后一次有效快照；不计入“当前页有效”。")
     if simulation_config and simulation_config.enabled:
+        if statistics_config:
+            cfg = statistics_config
+            window = {"total": "总窗", "long": "长窗", "short": "短窗"}[cfg.threshold_window]
+            if cfg.threshold_mode == "fixed":
+                rule = f"开 > μ{cfg.open_threshold_bps:+g}，平 < μ{cfg.close_threshold_bps:+g}；回到μ复位"
+                warmup = 2
+            elif cfg.threshold_mode == "sigma":
+                rule = (
+                    f"开 > μ+{cfg.open_threshold_sigma:g}σ，"
+                    f"平 < μ-{cfg.close_threshold_sigma:g}σ；回到μ复位"
+                )
+                warmup = cfg.threshold_min_samples
+            else:
+                rule = (
+                    f"开 > P{cfg.open_threshold_quantile * 100:g}，"
+                    f"平 < P{cfg.close_threshold_quantile * 100:g}；回到P50复位"
+                )
+                warmup = cfg.threshold_min_samples
+            lines.append(
+                f"模拟触发 {cfg.threshold_mode}/{window} | {rule} | "
+                f"至少 {warmup} 个有效行情统计样本；修改触发规则重置对应模拟结果。"
+            )
         lines.append(
             f"滑点模拟 {simulation_config.order_notional_usdt:g}U | "
             f"maker假定成交 {simulation_config.exchange_delay_ms:g}ms，"
             f"taker追加延迟 {simulation_config.deal_delay_ms:g}ms | "
-            f"至少 {simulation_config.min_samples} 个有效样本评分；异常不计入均值。"
+            f"开、平各至少 {simulation_config.min_samples} 个有效样本评分；异常不计入均值。"
         )
         lines.append(
-            "滑点正值为成本、负值为改善；Score 为本页相对排序，未评分时沿用开/平次数排序。"
+            f"模拟开/平/异常及 edge 统计最近 {simulation_config.window_samples} 次已完成模拟；"
+            "Profit指数 = min(开,平) × (开edge + 平edge)，非 USDT 利润或年化收益。"
         )
+        lines.append(
+            "滑点正值为成本、负值为改善；净edge已扣手续费。Score 为本页相对评分，"
+            "未评分时按 Profit指数排序；缺少任一方向时指数显示 —。"
+        )
+        if score_config and score_config.enabled:
+            weight = score_config.profit_weight + score_config.slippage_weight
+            lines.append(
+                f"Score: Profit排名 {score_config.profit_weight / weight:.0%} + "
+                f"滑点风险排名 {score_config.slippage_weight / weight:.0%}，"
+                f"乘可评估覆盖率和 min(1,配对次数/{score_config.confidence_paired_samples})；"
+                f"任一方向超过 {score_config.max_sample_age_seconds:g}s 无有效样本不评分，"
+                "Profit≤0 时 Score=0。"
+            )
     if page == "spot_perp":
         lines.append(
             "现货/永续基差 = 折算为 USDT 后的永续 ask / 现货 bid - 1；成交额按市场报价币计。"

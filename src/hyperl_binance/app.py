@@ -372,18 +372,7 @@ async def run() -> None:
                     history = histories[route.route_id]
                     history.config = stat_managers[route.category].current
                     history.quantile_refresh_seconds = runtime.quantile_refresh_seconds
-                    event = history.add(snapshot)
-                    if event:
-                        storage.emit(
-                            f"{route.category}/{route.base}/opportunities.jsonl",
-                            {
-                                "ts": time.time(),
-                                "route": route.route_id,
-                                "spread_bps": snapshot.spread_bps,
-                                "open_count": history.stats.open_count,
-                                "close_count": history.stats.close_count,
-                            },
-                        )
+                    history.add(snapshot)
                     valid_count += 1
                     valid_route_ids.add(route.route_id)
                     valid_by_direction[f"h_{route.hyperliquid.kind}_b_{route.binance.kind}"] += 1
@@ -391,16 +380,15 @@ async def run() -> None:
                     invalid[reason] = invalid.get(reason, 0) + 1
                     direction = f"h_{route.hyperliquid.kind}_b_{route.binance.kind}"
                     invalid_by_direction.setdefault(direction, Counter())[reason] += 1
+            threshold_levels = {}
+            for route in routes:
+                history = histories[route.route_id]
+                history.config = stat_managers[route.category].current
+                history.quantile_refresh_seconds = runtime.quantile_refresh_seconds
+                threshold_levels[route.route_id] = history.trigger_thresholds()
             policy_time = time.monotonic_ns()
             policies = {
-                route.route_id: SignalPolicy(
-                    histories[route.route_id].stats.mean_bps,
-                    stat_managers[route.category].current.open_threshold_bps,
-                    stat_managers[route.category].current.close_threshold_bps,
-                    policy_time,
-                )
-                for route in routes
-                if histories[route.route_id].stats.sample_count >= 2
+                rid: SignalPolicy(levels, policy_time) for rid, levels in threshold_levels.items()
             }
             simulation.configure(
                 routes, instruments, policies, simulation_manager.current, market_manager.current
@@ -518,7 +506,16 @@ async def run() -> None:
                     "simulation_queue_dropped": simulation.queue_dropped,
                     "simulation_depth_updates": feed.counters.get("simulation_depth_updates", 0),
                     "simulation_samples": sum(s["samples"] for s in simulation_view.values()),
+                    "simulation_open_samples": sum(
+                        s["open_samples"] for s in simulation_view.values()
+                    ),
+                    "simulation_close_samples": sum(
+                        s["close_samples"] for s in simulation_view.values()
+                    ),
                     "simulation_invalid": sum(s["invalid"] for s in simulation_view.values()),
+                    "simulation_invalid_total": sum(
+                        s["invalid_total"] for s in simulation_view.values()
+                    ),
                     "simulation_error": simulation.last_error,
                     "last_error": feed.last_error,
                 }
@@ -605,6 +602,7 @@ async def run() -> None:
                     simulations=simulation_view,
                     simulation_config=simulation_manager.current,
                     score_config=score_manager.current,
+                    statistics_config=stat_managers[category].current,
                 )
                 last_render = loop_time
             if _read_k():

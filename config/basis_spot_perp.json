@@ -8,5 +8,12 @@
   "sigma_multiplier": 2.0,
   "min_k_sigma_bps": 2.0,
   "open_threshold_bps": 7.0,
-  "close_threshold_bps": -5.0
+  "close_threshold_bps": -5.0,
+  "threshold_mode": "sigma",
+  "threshold_window": "long",
+  "open_threshold_sigma": 2.0,
+  "close_threshold_sigma": 2.0,
+  "open_threshold_quantile": 0.95,
+  "close_threshold_quantile": 0.05,
+  "threshold_min_samples": 120
 }

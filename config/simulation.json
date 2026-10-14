@@ -1,8 +1,8 @@
 {
   "enabled": true,
   "order_notional_usdt": 10,
-  "exchange_delay_ms": 20,
-  "deal_delay_ms": 30,
+  "exchange_delay_ms": 40,
+  "deal_delay_ms": 60,
   "resolution_grace_ms": 5,
   "max_data_age_ms": 3000,
   "history_seconds": 15,
@@ -10,9 +10,9 @@
   "window_samples": 500,
   "min_samples": 5,
   "fees_bps": {
-    "binance_spot": {"maker": 10, "taker": 10},
-    "binance_perp": {"maker": 2, "taker": 5},
-    "hyperliquid_spot": {"maker": 4, "taker": 7},
+    "binance_spot": {"maker": 2, "taker": 3},
+    "binance_perp": {"maker": 0.4, "taker": 2.2},
+    "hyperliquid_spot": {"maker": 2, "taker": 5},
     "hyperliquid_perp": {"maker": 1.5, "taker": 4.5}
   }
 }

@@ -8,14 +8,11 @@ import numpy as np
 
 from ..config.settings import StatisticsConfig
 from .models import SpreadSnapshot
+from .thresholds import TriggerLevels, resolve_thresholds
 
 
 @dataclass(slots=True)
-class OpportunityStats:
-    open_count: int = 0
-    close_count: int = 0
-    above: bool = False
-    below: bool = False
+class DistributionStats:
     mean_bps: float = 0.0
     sigma_bps: float = 0.0
     low_bps: float = 0.0
@@ -32,24 +29,6 @@ class OpportunityStats:
     mean_short_bps: float = 0.0
     sigma_short_bps: float = 0.0
 
-    def update(self, value: float, config: StatisticsConfig) -> bool:
-        event = False
-        if value >= self.mean_bps + config.open_threshold_bps:
-            if not self.above:
-                self.open_count += 1
-                event = True
-            self.above = True
-        elif value <= self.mean_bps:
-            self.above = False
-        if value <= self.mean_bps + config.close_threshold_bps:
-            if not self.below:
-                self.close_count += 1
-                event = True
-            self.below = True
-        elif value >= self.mean_bps:
-            self.below = False
-        return event
-
 
 class RouteHistory:
     def __init__(self, config: StatisticsConfig, quantile_refresh_seconds: float = 15.0) -> None:
@@ -57,13 +36,21 @@ class RouteHistory:
         self.quantile_refresh_seconds = quantile_refresh_seconds
         self.samples: deque[tuple[float, float]] = deque(maxlen=config.total_window_samples)
         self.current: SpreadSnapshot | None = None
-        self.stats = OpportunityStats()
+        self.stats = DistributionStats()
         self._last_quantile = 0.0
         self._total_sum = self._total_sumsq = 0.0
         self._long: deque[float] = deque()
         self._short: deque[float] = deque()
         self._long_sum = self._long_sumsq = 0.0
         self._short_sum = self._short_sumsq = 0.0
+        self._window_limits = (
+            config.total_window_samples,
+            config.long_window_samples,
+            config.short_window_samples,
+        )
+        self._trigger_quantile_key: tuple | None = None
+        self._trigger_quantiles: tuple[float, float, float] | None = None
+        self._last_trigger_quantile = 0.0
         self.funding_samples: deque[tuple[float, float | None, float | None]] = deque(
             maxlen=31 * 24 + 2
         )
@@ -104,7 +91,8 @@ class RouteHistory:
 
         return average(0), average(1)
 
-    def add(self, snapshot: SpreadSnapshot) -> bool:
+    def add(self, snapshot: SpreadSnapshot) -> None:
+        self._sync_windows()
         self.current = snapshot
         if len(self.samples) == self.samples.maxlen:
             old = self.samples[0][1]
@@ -164,7 +152,72 @@ class RouteHistory:
             )
             self._last_quantile = snapshot.sampled_at
         self.stats.sample_count = len(self.samples)
-        return self.stats.update(snapshot.spread_bps, self.config)
+
+    def _sync_windows(self) -> None:
+        limits = (
+            self.config.total_window_samples,
+            self.config.long_window_samples,
+            self.config.short_window_samples,
+        )
+        if limits == self._window_limits:
+            return
+        self.samples = deque(list(self.samples)[-limits[0] :], maxlen=limits[0])
+        values = [value for _ts, value in self.samples]
+        self._total_sum, self._total_sumsq = sum(values), sum(v * v for v in values)
+        for size, attr in ((limits[1], "long"), (limits[2], "short")):
+            selected = values[-size:]
+            setattr(self, f"_{attr}", deque(selected))
+            setattr(self, f"_{attr}_sum", sum(selected))
+            setattr(self, f"_{attr}_sumsq", sum(v * v for v in selected))
+        self._window_limits = limits
+        self._last_quantile = self._last_trigger_quantile = 0.0
+        self._trigger_quantile_key = None
+
+    def trigger_thresholds(self) -> TriggerLevels:
+        """Publish route-specific thresholds without coupling to execution models."""
+        self._sync_windows()
+        if self.config.threshold_window == "total":
+            count, total, squares = len(self.samples), self._total_sum, self._total_sumsq
+        else:
+            attr = self.config.threshold_window
+            count = len(getattr(self, f"_{attr}"))
+            total, squares = getattr(self, f"_{attr}_sum"), getattr(self, f"_{attr}_sumsq")
+        mean, sigma = self._moments(total, squares, count)
+        quantiles = None
+        if self.config.threshold_mode != "quantile":
+            self._trigger_quantile_key = None
+        if self.config.threshold_mode == "quantile" and count >= self.config.threshold_min_samples:
+            key = (
+                self.config.threshold_window,
+                getattr(self.config, f"{self.config.threshold_window}_window_samples"),
+                self.config.close_threshold_quantile,
+                self.config.open_threshold_quantile,
+                self.config.threshold_min_samples,
+                self.quantile_refresh_seconds,
+            )
+            now = self.current.sampled_at if self.current else 0.0
+            if key != self._trigger_quantile_key or (
+                now - self._last_trigger_quantile >= self.quantile_refresh_seconds
+            ):
+                values = (
+                    [value for _ts, value in self.samples]
+                    if self.config.threshold_window == "total"
+                    else list(getattr(self, f"_{self.config.threshold_window}"))
+                )
+                self._trigger_quantiles = tuple(
+                    float(value)
+                    for value in np.quantile(
+                        values,
+                        (
+                            self.config.close_threshold_quantile,
+                            0.5,
+                            self.config.open_threshold_quantile,
+                        ),
+                    )
+                )
+                self._trigger_quantile_key, self._last_trigger_quantile = key, now
+            quantiles = self._trigger_quantiles
+        return resolve_thresholds(self.config, count, mean, sigma, quantiles)
 
     @staticmethod
     def _moments(total: float, sumsq: float, count: int) -> tuple[float, float]:

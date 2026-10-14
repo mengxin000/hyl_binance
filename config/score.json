@@ -1,7 +1,8 @@
 {
   "enabled": true,
-  "slippage_weight": 0.8,
-  "opportunity_weight": 0.2,
+  "profit_weight": 0.6,
+  "slippage_weight": 0.4,
   "tail_weight": 0.5,
+  "confidence_paired_samples": 30,
   "max_sample_age_seconds": 300
 }

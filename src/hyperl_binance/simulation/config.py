@@ -24,8 +24,8 @@ class SimulationConfig:
     max_data_age_ms: float = 3000.0
     history_seconds: float = 15.0
     history_events_per_instrument: int = 5000
-    window_samples: int = 500
-    min_samples: int = 5
+    window_samples: int = 500  # Resolved observations, including unavailable ones.
+    min_samples: int = 5  # Required valid observations in EACH direction to score.
     fees_bps: dict[str, dict[str, float]] = field(default_factory=default_fees)
 
     def validate(self) -> None:
@@ -54,8 +54,8 @@ class SimulationConfig:
             for v in (self.min_samples, self.window_samples, self.history_events_per_instrument)
         ):
             raise ValueError("样本数与事件容量必须是整数")
-        if not 1 <= self.min_samples <= self.window_samples <= 10000:
-            raise ValueError("需要 1 <= min_samples <= window_samples <= 10000")
+        if self.min_samples < 1 or not 2 * self.min_samples <= self.window_samples <= 10000:
+            raise ValueError("需要 min_samples >= 1，2 * min_samples <= window_samples <= 10000")
         if self.history_events_per_instrument < 100:
             raise ValueError("history_events_per_instrument 至少为 100")
         if not isinstance(self.fees_bps, dict) or set(self.fees_bps) != set(default_fees()):
@@ -71,25 +71,28 @@ class SimulationConfig:
 @dataclass(frozen=True, slots=True)
 class ScoreConfig:
     enabled: bool = True
-    slippage_weight: float = 0.8
-    opportunity_weight: float = 0.2
+    profit_weight: float = 0.6
+    slippage_weight: float = 0.4
     tail_weight: float = 0.5
+    confidence_paired_samples: int = 30
     max_sample_age_seconds: float = 300.0
 
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled 必须是 JSON 布尔值")
         values = (
+            self.profit_weight,
             self.slippage_weight,
-            self.opportunity_weight,
             self.tail_weight,
             self.max_sample_age_seconds,
         )
         if any(not isfinite(v) for v in values):
             raise ValueError("评分参数必须是有限数值")
-        if min(self.slippage_weight, self.opportunity_weight) < 0 or (
-            self.slippage_weight + self.opportunity_weight <= 0
+        if min(self.slippage_weight, self.profit_weight) < 0 or (
+            self.slippage_weight + self.profit_weight <= 0
         ):
             raise ValueError("评分权重必须非负且合计大于零")
         if not 0 <= self.tail_weight <= 1 or self.max_sample_age_seconds <= 0:
             raise ValueError("tail_weight 需要在 0~1，评分样本有效期必须为正")
+        if type(self.confidence_paired_samples) is not int or self.confidence_paired_samples < 1:
+            raise ValueError("confidence_paired_samples 必须为正整数")

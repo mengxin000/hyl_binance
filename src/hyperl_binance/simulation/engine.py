@@ -8,6 +8,7 @@ from typing import Callable
 from ..config.settings import MarketConfig
 from ..domain.market_events import MarketEvent, QuoteEvent, StreamReset
 from ..domain.models import Instrument, SpreadRoute
+from ..domain.thresholds import TriggerLevels
 from .config import SimulationConfig
 from .expectation import ExpectationModel
 from .fees import FeeModel
@@ -17,9 +18,7 @@ from .orderbook import ObservationUnavailable, OrderBookModel
 
 @dataclass(frozen=True, slots=True)
 class SignalPolicy:
-    mean_bps: float
-    open_threshold_bps: float
-    close_threshold_bps: float
+    levels: TriggerLevels
     available_ns: int = 0
 
 
@@ -46,6 +45,7 @@ class Observation:
     maker_reference: float
     taker_reference: float
     config: SimulationConfig
+    trigger_levels: TriggerLevels | None = None
     signal_basis_bps: float = 0.0
     mean_bps: float = 0.0
     maker_quote_ns: int | None = None
@@ -87,6 +87,7 @@ class SimulationEngine:
             self.pending.clear()
             self.gates.clear()
             self.results.clear()
+            self.policies.clear()
             self.books = OrderBookModel(config)
             self.config = config
             self.scenario_id = self._scenario_id(config)
@@ -99,6 +100,22 @@ class SimulationEngine:
                 }
             )
         self.routes = {route.route_id: route for route in routes}
+        for rid, policy in policies.items():
+            previous = self.policies.get(rid)
+            if previous is not None and previous.levels.rule_id != policy.levels.rule_id:
+                if rid in self.pending:
+                    self._fail(rid, "threshold_rule_changed")
+                self.results.pop(rid, None)
+                self.gates.pop(rid, None)
+                self.emit(
+                    {
+                        "type": "threshold_rule_reset",
+                        "route": rid,
+                        "old_rule_id": previous.levels.rule_id,
+                        "trigger": asdict(policy.levels),
+                        "scenario_id": self.scenario_id,
+                    }
+                )
         self.policies, self.market = policies, market
         self.by_instrument = {}
         for route in routes:
@@ -118,6 +135,11 @@ class SimulationEngine:
             if rid not in self.routes:
                 self.results.pop(rid)
                 self.gates.pop(rid, None)
+        # Include waiting routes in snapshots so the dashboard can display
+        # warm-up progress and the actual levels even before any execution.
+        for rid in self.routes:
+            if rid not in self.results:
+                self.results[rid] = ExpectationModel(self.config.window_samples)
 
     def reset(self, reason: str) -> None:
         for rid in tuple(self.pending):
@@ -163,8 +185,10 @@ class SimulationEngine:
 
     def _signal(self, rid: str, t0: int) -> None:
         policy, route = self.policies.get(rid), self.routes[rid]
-        if policy is None or t0 < policy.available_ns:
+        if policy is None or not policy.levels.ready or t0 < policy.available_ns:
             return
+        levels = policy.levels
+        assert levels.open_bps is not None and levels.close_bps is not None
         try:
             h = self.books.quote_at(route.hyperliquid.key, t0)
             b = self.books.quote_at(route.binance.key, t0)
@@ -187,17 +211,17 @@ class SimulationEngine:
             value = (hm / bm - 1) * 10000
         above, below = self.gates.get(rid, (False, False))
         phase = None
-        if value > policy.mean_bps + policy.open_threshold_bps:
+        if value > levels.open_bps:
             if not above:
                 phase = "open"
             above = True
-        elif value <= policy.mean_bps:
+        elif value <= levels.rearm_bps:
             above = False
-        if value < policy.mean_bps + policy.close_threshold_bps:
+        if value < levels.close_bps:
             if not below:
                 phase = "close"
             below = True
-        elif value >= policy.mean_bps:
+        elif value >= levels.rearm_bps:
             below = False
         self.gates[rid] = above, below
         if phase is None or rid in self.pending:
@@ -215,8 +239,9 @@ class SimulationEngine:
             (mq.bid if phase == "open" else mq.ask) * mr,
             (tq.bid if phase == "open" else tq.ask) * tr,
             self.config,
+            trigger_levels=levels,
             signal_basis_bps=value,
-            mean_bps=policy.mean_bps,
+            mean_bps=levels.mean_bps,
         )
         self.results.setdefault(rid, ExpectationModel(self.config.window_samples)).attempts += 1
 
@@ -261,6 +286,7 @@ class SimulationEngine:
             "phase": job.phase,
             "signal_basis_bps": job.signal_basis_bps,
             "mean_bps": job.mean_bps,
+            "trigger": asdict(job.trigger_levels) if job.trigger_levels is not None else None,
             "signal_ns": job.signal_ns,
             "maker_target_ns": job.maker_target_ns,
             "taker_target_ns": job.taker_target_ns,
@@ -294,7 +320,7 @@ class SimulationEngine:
 
     def _fail(self, rid: str, reason: str) -> None:
         job = self.pending.pop(rid)
-        self.results[rid].invalid[reason] += 1
+        self.results[rid].record_unavailable(job.phase, reason)
         self.emit(
             {
                 "type": "unavailable_observation",
@@ -302,12 +328,17 @@ class SimulationEngine:
                 "route": rid,
                 "phase": job.phase,
                 "signal_ns": job.signal_ns,
+                "trigger": asdict(job.trigger_levels) if job.trigger_levels is not None else None,
                 "reason": reason,
             }
         )
 
     def view(self) -> dict[str, dict]:
         return {
-            rid: {**result.view(), "pending": rid in self.pending}
+            rid: {
+                **result.view(),
+                "pending": rid in self.pending,
+                "trigger": asdict(self.policies[rid].levels) if rid in self.policies else None,
+            }
             for rid, result in self.results.items()
         }

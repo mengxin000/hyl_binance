@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -56,6 +57,13 @@ class StatisticsConfig:
     min_k_sigma_bps: float = 2.0
     open_threshold_bps: float = 7.0
     close_threshold_bps: float = -5.0
+    threshold_mode: str = "fixed"
+    threshold_window: str = "total"
+    open_threshold_sigma: float = 2.0
+    close_threshold_sigma: float = 2.0
+    open_threshold_quantile: float = 0.95
+    close_threshold_quantile: float = 0.05
+    threshold_min_samples: int = 120
 
     def validate(self) -> None:
         if self.top < 1:
@@ -73,6 +81,30 @@ class StatisticsConfig:
             raise ValueError("sigma_multiplier 和 min_k_sigma_bps 必须大于 0")
         if self.open_threshold_bps <= 0 or self.close_threshold_bps >= 0:
             raise ValueError("开仓阈值必须为正，平仓阈值必须为负")
+        if self.threshold_mode not in {"fixed", "sigma", "quantile"}:
+            raise ValueError("threshold_mode 只支持 fixed、sigma、quantile")
+        if self.threshold_window not in {"total", "long", "short"}:
+            raise ValueError("threshold_window 只支持 total、long、short")
+        values = (
+            self.open_threshold_bps,
+            self.close_threshold_bps,
+            self.open_threshold_sigma,
+            self.close_threshold_sigma,
+            self.open_threshold_quantile,
+            self.close_threshold_quantile,
+        )
+        if any(type(value) not in {int, float} or not isfinite(value) for value in values):
+            raise ValueError("触发阈值参数必须是有限数值")
+        if min(self.open_threshold_sigma, self.close_threshold_sigma) <= 0:
+            raise ValueError("开、平的 sigma 倍数必须为正")
+        if not 0 <= self.close_threshold_quantile < 0.5 < self.open_threshold_quantile <= 1:
+            raise ValueError("分位数触发须满足 0 <= close < 0.5 < open <= 1")
+        window_limit = getattr(self, f"{self.threshold_window}_window_samples")
+        if (
+            type(self.threshold_min_samples) is not int
+            or not 2 <= self.threshold_min_samples <= window_limit
+        ):
+            raise ValueError("threshold_min_samples 必须是 2 到所选窗口容量之间的整数")
 
 
 @dataclass(frozen=True, slots=True)
