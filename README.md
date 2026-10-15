@@ -53,7 +53,7 @@ src/hyperl_binance/
 - `config/basis_spot_spot.json`、`basis_spot_perp.json`、`basis_perp_perp.json`：各类统计窗口、分位数与阈值。
 - `config/runtime.json`：采样周期、新鲜度、WebSocket 分片与持久化参数。
 - `config/simulation.json`：固定下单金额、两段延迟、数据年龄、样本窗口和 maker/taker 费率。
-- `config/score.json`：Profit指数与滑点风险权重、尾部风险权重、样本置信度与评分样本有效期。
+- `config/score.json`：Profit指数与滑点风险权重、尾部风险权重和样本数量折减。
 
 `quantile_refresh_seconds` 控制每条路线重算 P5/P95 分位数的间隔；修改运行配置后会热加载到已有路线。
 `hyperliquid_subscriptions_per_connection` 是 HL 每个 WebSocket shard 的目标订阅数，范围为 1–10；程序按现货/永续分组，且单进程最多打开 10 条 HL WebSocket。若同一币种连续三次在订阅确认阶段断连，会暂时从当前市场集合隔离，避免它反复拖断同 shard 的其他行情；市场集合变化后会重新尝试。
@@ -126,7 +126,7 @@ Profit指数 = 配对次数 * 配对净edge
 
 ### Score
 
-Score 只使用模拟统计，在当前页满足原列表筛选条件的路线中计算。开平各须满足最低样本数，且任一方向最新有效样本不能超过 `max_sample_age_seconds=300` 秒。样本不足或过期显示 `—`；合格但 Profit指数不大于0的路线 Score=0，避免只靠低滑点获得高分。
+Score 只使用模拟统计，在当前页满足原列表筛选条件的路线中计算。开平各须满足最低样本数，不按历史样本年龄暂停评分。样本不足或评分关闭时显示 `—`；合格但 Profit指数不大于0的路线 Score=0，避免只靠低滑点获得高分。滚动窗口移除旧样本或修改场景/触发规则重置结果后，仍可能重新不足最低样本数。模拟所用实时行情的新鲜度校验独立生效。
 
 对其余合格且 Profit指数为正的路线，按本页进行相对排名：Profit指数越高越好，滑点风险越低越好。排名采用并列平均名次归一化到0~1；只有一个合格正收益路线时两个排名均为0.5。
 
@@ -150,11 +150,18 @@ Score = 100 * 覆盖率 * 样本折减
 | `slippage_weight` | `0.4` | 滑点风险排名权重 |
 | `tail_weight` | `0.5` | 风险中P95所占比例，其余为平均滑点 |
 | `confidence_paired_samples` | `30` | 样本折减达到1所需的配对次数 |
-| `max_sample_age_seconds` | `300` | 开、平两侧各自最新有效样本的最大年龄 |
 
 排序先使用Score，再以Profit指数、配对次数、有效样本总数打破并列；未评分路线排在后面，使用同样的Profit排序。关闭Score后直接按Profit指数排序；关闭模拟后按路线名称稳定排序。一秒开/平计数及旧的 `opportunity_weight` 配置已移除。
 
-`data/simulation/observations.jsonl` 保存有场景 ID 的逐次观测和异常原因，按网络日志上限滚动。`data/simulation/state.json` 保存当前配置与各路线聚合结果。重启后重新积累，不从旧场景恢复评分。
+### 模拟文件记录
+
+- `data/simulation/observations.jsonl`：逐行追加的模拟事件日志，每行一个JSON对象。有效事件 `execution_observation` 记录路线、开平方向、触发基差与阈值快照、两段目标时间、选用报价时间、模拟数量、参考价、maker成交价、taker扫单均价、两腿手续费、延迟/深度/总滑点、净edge和深度来源。`unavailable_observation` 记录无法评估的路线、方向及原因；`scenario_reset`、`threshold_rule_reset` 记录配置切换。
+- `data/simulation/observations.1.jsonl`：上一份滚动日志。当前文件达到 `runtime.network_log_max_bytes`（默认20,000,000字节，约20MB）后转为此文件，只保留一个旧备份，后续轮转会覆盖。
+- `data/simulation/state.json`：按 `runtime.persist_interval_seconds`（默认60秒，主循环繁忙时可延后）覆盖写入的最新汇总快照，包括模拟配置、Score配置、队列丢弃数，以及各路线的开平/异常数、滑点均值与P95、开平平均edge、Profit指数、实际触发线和待处理状态。Score数值在CLI按当前页面即时计算，快照保存它依赖的聚合指标及配置。
+
+日志中 `ts` 是事件日志生成时的Unix秒时间；`signal_ns`、`maker_target_ns`、`taker_target_ns`、`maker_quote_ns`、`taker_quote_ns` 使用本机单调时钟纳秒，用于检查目标延迟和报价年龄，不应直接转换为日历时间。`scenario_id` 是模拟配置指纹，阈值快照中的 `rule_id` 是触发规则指纹，均不是唯一运行编号。日志可跨多次运行追加，历史版本可能缺少新字段。
+
+这些文件用于追溯执行估算及排查数据异常；没有保存全量逐条BBO或完整盘口历史。重启后重新积累样本，不从 `state.json` 或旧日志恢复评分。
 
 可用 `uv run python -m unittest discover -s tests -v` 运行离线模型与流适配测试。
 

@@ -75,7 +75,6 @@ class ScoreConfig:
     slippage_weight: float = 0.4
     tail_weight: float = 0.5
     confidence_paired_samples: int = 30
-    max_sample_age_seconds: float = 300.0
 
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -84,7 +83,6 @@ class ScoreConfig:
             self.profit_weight,
             self.slippage_weight,
             self.tail_weight,
-            self.max_sample_age_seconds,
         )
         if any(not isfinite(v) for v in values):
             raise ValueError("评分参数必须是有限数值")
@@ -92,7 +90,7 @@ class ScoreConfig:
             self.slippage_weight + self.profit_weight <= 0
         ):
             raise ValueError("评分权重必须非负且合计大于零")
-        if not 0 <= self.tail_weight <= 1 or self.max_sample_age_seconds <= 0:
-            raise ValueError("tail_weight 需要在 0~1，评分样本有效期必须为正")
+        if not 0 <= self.tail_weight <= 1:
+            raise ValueError("tail_weight 需要在 0~1")
         if type(self.confidence_paired_samples) is not int or self.confidence_paired_samples < 1:
             raise ValueError("confidence_paired_samples 必须为正整数")

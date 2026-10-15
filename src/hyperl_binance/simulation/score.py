@@ -16,7 +16,6 @@ def score_routes(
     route_ids: set[str],
     config: ScoreConfig,
     min_samples: int,
-    now_ns: int,
 ) -> dict[str, float]:
     """Rank paired net edge and execution risk using simulation observations only."""
     if not config.enabled:
@@ -24,12 +23,7 @@ def score_routes(
     eligible = {
         rid: result
         for rid, result in simulations.items()
-        if rid in route_ids
-        and result.get("paired_samples", 0) >= min_samples
-        and all(
-            0 <= now_ns - result[f"last_{phase}_received_ns"] <= config.max_sample_age_seconds * 1e9
-            for phase in ("open", "close")
-        )
+        if rid in route_ids and result.get("paired_samples", 0) >= min_samples
     }
     profitable = {rid: result for rid, result in eligible.items() if result["profit_index"] > 0}
     risks = {

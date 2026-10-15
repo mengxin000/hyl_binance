@@ -3,6 +3,5 @@
   "profit_weight": 0.6,
   "slippage_weight": 0.4,
   "tail_weight": 0.5,
-  "confidence_paired_samples": 30,
-  "max_sample_age_seconds": 300
+  "confidence_paired_samples": 30
 }

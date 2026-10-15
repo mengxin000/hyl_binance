@@ -296,7 +296,6 @@ def render(
         if simulation_config and simulation_config.enabled and score_config
         else ScoreConfig(enabled=False),
         simulation_config.min_samples if simulation_config else 5,
-        time.monotonic_ns(),
     )
 
     def sort_key(history):
@@ -506,8 +505,7 @@ def render(
                 f"Score: Profit排名 {score_config.profit_weight / weight:.0%} + "
                 f"滑点风险排名 {score_config.slippage_weight / weight:.0%}，"
                 f"乘可评估覆盖率和 min(1,配对次数/{score_config.confidence_paired_samples})；"
-                f"任一方向超过 {score_config.max_sample_age_seconds:g}s 无有效样本不评分，"
-                "Profit≤0 时 Score=0。"
+                "不按历史样本年龄暂停评分；Profit≤0 时 Score=0。"
             )
     if page == "spot_perp":
         lines.append(
